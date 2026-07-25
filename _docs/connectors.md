@@ -59,8 +59,45 @@ disown
   distros alias to Podman) will pick it up automatically once the service
   above is running.
 - This only lasts for the current shell session/until the process is killed
-  - there's no systemd to keep it running across reboots, so re-run it (or
-  add it to your shell profile) whenever the socket disappears.
+  - there's no systemd to keep it running across reboots.
+
+##### Starting it automatically (so you don't have to by hand every time)
+
+**Option 1 - shell profile (simplest, works today).** Add this to
+`~/.bashrc`/`~/.zshrc`. It's idempotent - it only spawns a new service if one
+isn't already answering on the socket, so it's safe to source in every new
+terminal:
+
+```bash
+# Auto-start Podman's API socket (WSL2 has no systemd to do this for us)
+if [ -n "$XDG_RUNTIME_DIR" ] && \
+   ! curl -s --max-time 1 --unix-socket "$XDG_RUNTIME_DIR/podman/podman.sock" http://d/_ping >/dev/null 2>&1; then
+  mkdir -p "$XDG_RUNTIME_DIR/podman"
+  nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" \
+    >/tmp/podman-service.log 2>&1 &
+  disown
+fi
+export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+```
+
+**Option 2 - true WSL boot-time start (no shell required).** Recent WSL2
+(≥ 0.67, `wsl --version` from Windows) can run a command as root when the
+Linux VM itself boots, before any shell or login, via `/etc/wsl.conf`:
+
+```ini
+# /etc/wsl.conf
+[boot]
+command = "runuser -u <your-username> -- sh -c 'mkdir -p /run/user/$(id -u <your-username>)/podman && podman system service --time=0 unix:///run/user/$(id -u <your-username>)/podman/podman.sock &'"
+```
+
+Then from Windows (not inside WSL): `wsl --shutdown`, then reopen your distro
+for it to take effect. Caveats: this always runs as root, so it needs
+`runuser`/`su` to drop into your user for a *rootless* Podman socket; and on
+WSLg setups `$XDG_RUNTIME_DIR` may actually be `/mnt/wslg/runtime-dir` rather
+than `/run/user/<uid>` (check `echo $XDG_RUNTIME_DIR` in your normal shell
+first and adjust the path above to match). Because of that path variance,
+Option 1 is the more portable default - use Option 2 only if you specifically
+want the socket up before any shell opens.
 
 ## RunC
 

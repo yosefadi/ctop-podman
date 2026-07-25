@@ -105,8 +105,9 @@ Build steps can be found [here][build].
 `ctop` requires no arguments and uses Docker host variables by default. Pass `-connector podman` to target Podman instead. See [connectors][connectors] for further configuration options.
 
 > **Podman on WSL2**: WSL2 usually has no systemd, so Podman's API socket
-> isn't auto-activated. Start it manually before running `ctop` - see the
-> [WSL2 section][connectors] of the connectors doc.
+> isn't auto-activated - see the [WSL2 section][connectors] of the connectors
+> doc for how to start it, including a shell-profile snippet so you don't
+> have to do it by hand every session.
 
 ### Config file
 
