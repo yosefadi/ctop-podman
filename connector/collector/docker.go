@@ -1,6 +1,8 @@
 package collector
 
 import (
+	"strings"
+
 	"github.com/bcicen/ctop/models"
 	api "github.com/fsouza/go-dockerclient"
 )
@@ -15,13 +17,15 @@ type Docker struct {
 	done       chan bool
 	lastCpu    float64
 	lastSysCpu float64
+	hostNCPU   uint8
 }
 
-func NewDocker(client *api.Client, id string) *Docker {
+func NewDocker(client *api.Client, id string, hostNCPU uint8) *Docker {
 	return &Docker{
-		Metrics: models.Metrics{},
-		id:      id,
-		client:  client,
+		Metrics:  models.Metrics{},
+		id:       id,
+		client:   client,
+		hostNCPU: hostNCPU,
 	}
 }
 
@@ -80,8 +84,22 @@ func (c *Docker) ReadCPU(stats *api.Stats) {
 	if ncpus == 0 {
 		ncpus = uint8(len(stats.CPUStats.CPUUsage.PercpuUsage))
 	}
+	if ncpus == 0 {
+		// Podman's compat stats endpoint leaves online_cpus/percpu_usage empty
+		// under cgroup v2, so fall back to the host's total CPU count.
+		ncpus = c.hostNCPU
+	}
 	total := float64(stats.CPUStats.CPUUsage.TotalUsage)
 	system := float64(stats.CPUStats.SystemCPUUsage)
+	if system == 0 {
+		// Podman's compat stats endpoint omits system_cpu_usage entirely
+		// (confirmed: its cpu_stats has cpu_usage/online_cpus/throttling_data
+		// but no system_cpu_usage key at all). That counter always advances
+		// at a fixed ncpus-per-nanosecond rate regardless of load, so
+		// wall-clock time times CPU count is an exact substitute, not just
+		// an approximation.
+		system = float64(stats.Read.UnixNano()) * float64(ncpus)
+	}
 
 	cpudiff := total - c.lastCpu
 	syscpudiff := system - c.lastSysCpu
@@ -111,10 +129,13 @@ func (c *Docker) ReadNet(stats *api.Stats) {
 func (c *Docker) ReadIO(stats *api.Stats) {
 	var read, write int64
 	for _, blk := range stats.BlkioStats.IOServiceBytesRecursive {
-		if blk.Op == "Read" {
+		// Docker reports "Read"/"Write"; Podman's compat endpoint reports the
+		// same operations lowercased ("read"/"write") plus extra op types
+		// (rios/wios/dbytes/dios) that both engines already skip by omission.
+		switch strings.ToLower(blk.Op) {
+		case "read":
 			read += int64(blk.Value)
-		}
-		if blk.Op == "Write" {
+		case "write":
 			write += int64(blk.Value)
 		}
 	}

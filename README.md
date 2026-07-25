@@ -11,9 +11,27 @@ Top-like interface for container metrics
 
 as well as a [single container view][single_view] for inspecting a specific container.
 
-`ctop` comes with built-in support for Docker and runC; connectors for other container and cluster systems are planned for future releases.
+`ctop` comes with built-in support for Docker, Podman, and runC; connectors for other container and cluster systems are planned for future releases.
+
+> This is a fork of [bcicen/ctop](https://github.com/bcicen/ctop) at
+> [yosefadi/ctop-podman](https://github.com/yosefadi/ctop-podman) with fixes
+> for running against Podman (CPU/IO stats, container lifecycle events). It
+> has no prebuilt releases yet, so install it by building from source - see
+> [below](#install-this-fork-podman-fixes). The package-manager methods further
+> down install the unmodified upstream project.
 
 ## Install
+
+#### Install this fork (Podman fixes)
+
+```bash
+git clone https://github.com/yosefadi/ctop-podman.git
+cd ctop-podman
+make build
+sudo install -m 755 ctop /usr/local/bin/ctop
+```
+
+#### Upstream releases
 
 Fetch the [latest release](https://github.com/bcicen/ctop/releases) for your platform:
 
@@ -84,7 +102,11 @@ Build steps can be found [here][build].
 
 ## Usage
 
-`ctop` requires no arguments and uses Docker host variables by default. See [connectors][connectors] for further configuration options.
+`ctop` requires no arguments and uses Docker host variables by default. Pass `-connector podman` to target Podman instead. See [connectors][connectors] for further configuration options.
+
+> **Podman on WSL2**: WSL2 usually has no systemd, so Podman's API socket
+> isn't auto-activated. Start it manually before running `ctop` - see the
+> [WSL2 section][connectors] of the connectors doc.
 
 ### Config file
 

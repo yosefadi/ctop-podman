@@ -20,6 +20,7 @@ func init() { enabled["docker"] = NewDocker }
 var actionToStatus = map[string]string{
 	"start":   "running",
 	"die":     "exited",
+	"died":    "exited",
 	"stop":    "exited",
 	"pause":   "paused",
 	"unpause": "running",
@@ -38,6 +39,7 @@ type Docker struct {
 	statuses     chan StatusUpdate
 	closed       chan struct{}
 	lock         sync.RWMutex
+	hostNCPU     uint8
 }
 
 func NewDocker() (Connector, error) {
@@ -46,6 +48,19 @@ func NewDocker() (Connector, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newDockerConnector(client)
+}
+
+// newDockerConnector wires up a Docker-API connector around an already
+// constructed client. Shared by the docker and podman connectors, since
+// Podman's compat API is Docker-API-compatible.
+func newDockerConnector(client *api.Client) (Connector, error) {
+	// query info as pre-flight healthcheck
+	info, err := client.Info()
+	if err != nil {
+		return nil, err
+	}
+
 	cm := &Docker{
 		client:       client,
 		containers:   make(map[string]*container.Container),
@@ -53,12 +68,7 @@ func NewDocker() (Connector, error) {
 		statuses:     make(chan StatusUpdate, 60),
 		closed:       make(chan struct{}),
 		lock:         sync.RWMutex{},
-	}
-
-	// query info as pre-flight healthcheck
-	info, err := client.Info()
-	if err != nil {
-		return nil, err
+		hostNCPU:     uint8(info.NCPU),
 	}
 
 	log.Debugf("docker-connector ID: %s", info.ID)
@@ -71,6 +81,7 @@ func NewDocker() (Connector, error) {
 	go cm.LoopStatuses()
 	cm.refreshAll()
 	go cm.watchEvents()
+	go cm.periodicResync()
 	return cm, nil
 }
 
@@ -81,34 +92,46 @@ func (cm *Docker) Wait() struct{} { return <-cm.closed }
 func (cm *Docker) watchEvents() {
 	log.Info("docker event listener starting")
 	events := make(chan *api.APIEvents)
+	// Deliberately not filtering on "event" here (only "type"). Verified
+	// against a live Podman socket: Podman's compat filter matching poisons
+	// the *entire* "event" filter list if it contains a single value Podman
+	// doesn't recognize (e.g. Docker's "destroy" - Podman's internal name is
+	// "remove") - so a combined Docker+Podman value list silently drops
+	// events that should have matched (confirmed: adding "destroy" to the
+	// list caused Podman to never deliver "remove" at all, even though
+	// "remove" was also in the list). Filtering client-side in the switch
+	// below instead works identically against both engines.
 	opts := api.EventsOptions{Filters: map[string][]string{
-		"type":  {"container"},
-		"event": {"create", "start", "health_status", "pause", "unpause", "stop", "die", "destroy"},
-	},
-	}
+		"type": {"container"},
+	}}
 	cm.client.AddEventListenerWithOptions(opts, events)
 
 	for e := range events {
 		actionName := e.Action
-		switch actionName {
-		// most frequent event is a health checks
-		case "health_status: healthy", "health_status: unhealthy":
-			sepIdx := strings.Index(actionName, ": ")
-			healthStatus := e.Action[sepIdx+2:]
-			if log.IsEnabledFor(logging.DEBUG) {
-				log.Debugf("handling docker event: action=health_status id=%s %s", e.ID, healthStatus)
-			}
-			cm.statuses <- StatusUpdate{e.ID, "health", healthStatus}
-		case "create":
+		switch {
+		case actionName == "create":
 			if log.IsEnabledFor(logging.DEBUG) {
 				log.Debugf("handling docker event: action=create id=%s", e.ID)
 			}
 			cm.needsRefresh <- e.ID
-		case "destroy":
+		case actionName == "destroy" || actionName == "remove":
+			// Podman's compat layer only rewrites "remove"->"destroy" for
+			// image events, not container events, so it arrives untranslated.
 			if log.IsEnabledFor(logging.DEBUG) {
-				log.Debugf("handling docker event: action=destroy id=%s", e.ID)
+				log.Debugf("handling docker event: action=%s id=%s", actionName, e.ID)
 			}
 			cm.delByID(e.ID)
+		case strings.HasPrefix(actionName, "health_status"):
+			// Docker encodes the new status in the action string itself
+			// ("health_status: healthy"); Podman emits a bare "health_status"
+			// and carries the value in a field go-dockerclient doesn't parse.
+			// Rather than depend on either engine's exact event shape, just
+			// re-inspect - refresh() already reads health straight from the
+			// container inspect response, which both engines populate.
+			if log.IsEnabledFor(logging.DEBUG) {
+				log.Debugf("handling docker event: action=%s id=%s", actionName, e.ID)
+			}
+			cm.needsRefresh <- e.ID
 		default:
 			// check if this action changes status e.g. start -> running
 			status := actionToStatus[actionName]
@@ -122,6 +145,37 @@ func (cm *Docker) watchEvents() {
 	}
 	log.Info("docker event listener exited")
 	close(cm.closed)
+}
+
+// periodicResync re-queues all known containers for refresh on a fixed
+// interval, bounding staleness even if a lifecycle event is dropped,
+// misshapen, or never emitted (health-status events in particular are
+// documented as unreliable on some Podman versions - see
+// containers/podman#13493, #19237, #24003). A no-op in practice against
+// Docker, where the event stream is already exhaustive.
+func (cm *Docker) periodicResync() {
+	const interval = 5 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			cm.lock.Lock()
+			ids := make([]string, 0, len(cm.containers))
+			for id := range cm.containers {
+				ids = append(ids, id)
+			}
+			cm.lock.Unlock()
+			for _, id := range ids {
+				select {
+				case cm.needsRefresh <- id:
+				default: // drop if the refresh queue is backed up; next tick retries
+				}
+			}
+		case <-cm.closed:
+			return
+		}
+	}
 }
 
 func portsFormat(ports map[api.Port][]api.PortBinding) string {
@@ -270,7 +324,7 @@ func (cm *Docker) MustGet(id string) *container.Container {
 	// append container struct for new containers
 	if !ok {
 		// create collector
-		collector := collector.NewDocker(cm.client, id)
+		collector := collector.NewDocker(cm.client, id, cm.hostNCPU)
 		// create manager
 		manager := manager.NewDocker(cm.client, id)
 		// create container
